@@ -299,9 +299,19 @@ TimestampStyle = namedtuple("TimestampStyle", ["size", "color", "box_opacity"])
 STYLE_PAR_DEFAUT = TimestampStyle(size=None, color="white", box_opacity=0.55)
 
 
+# Longueur maximale, en octets UTF-8, d'un nom de dossier tiré d'un nom de
+# caméra par safe_name().
+OCTETS_NOM_DOSSIER = 32
+
+
 def _tronquer_utf8(value: str, maximum: int) -> str:
     brut = value.encode("utf-8")[:maximum]
     return brut.decode("utf-8", errors="ignore")
+
+
+def _nettoyer_nom(value: str) -> str:
+    """Le nettoyage de safe_name(), avant sa troncature à OCTETS_NOM_DOSSIER."""
+    return re.sub(r"[^\w.-]+", "_", value, flags=re.UNICODE).strip("._")
 
 
 def safe_name(value: str) -> str:
@@ -324,8 +334,8 @@ def safe_name(value: str) -> str:
     encore confondre deux caméras dont le nom brut diffère mais se
     nettoie pareil - cas assez rare pour rester documenté plutôt que
     corrigé dans l'immédiat (voir BACKLOG.md)."""
-    cleaned = re.sub(r"[^\w.-]+", "_", value, flags=re.UNICODE).strip("._")
-    cleaned = _tronquer_utf8(cleaned, 32).rstrip(". ") or "camera"
+    cleaned = _nettoyer_nom(value)
+    cleaned = _tronquer_utf8(cleaned, OCTETS_NOM_DOSSIER).rstrip(". ") or "camera"
     racine = cleaned.split(".", 1)[0].casefold()
     reserves = {"con", "prn", "aux", "nul", *{f"com{i}" for i in range(1, 10)},
                 *{f"lpt{i}" for i in range(1, 10)}}
@@ -769,6 +779,21 @@ def read_registry(state_path: Path) -> dict:
     return entries
 
 
+def _nom_suffixe(nom: str, rang: int) -> str:
+    """« nom (rang) », dont safe_name() garde le suffixe.
+
+    safe_name() tronque à OCTETS_NOM_DOSSIER octets : au-delà, « (2) »,
+    « (3) »... tombaient avec la troncature et chaque candidat retrouvait le
+    dossier du nom nu. Le nom est alors raccourci juste assez pour que le
+    suffixe tienne ; un nom où il tient déjà garde exactement sa clé, donc son
+    dossier."""
+    suffixe = f" ({rang})"
+    base = nom
+    while base and len(_nettoyer_nom(base + suffixe).encode("utf-8")) > OCTETS_NOM_DOSSIER:
+        base = base[:-1]
+    return nom + suffixe if base == nom else base.rstrip() + suffixe
+
+
 def _cles_camera_par_collision(entries: dict) -> dict:
     """(nom, network_id) -> clé de regroupement, seulement pour les noms où
     une vraie collision existe.
@@ -803,7 +828,11 @@ def _cles_camera_par_collision(entries: dict) -> dict:
     journalières s'écrivaient au même chemin, l'une écrasant l'autre. Le nom
     déjà propre garde son dossier (l'historique déjà assemblé n'est pas
     déplacé), les autres reçoivent « (2) », « (3) »... ; la casse ne distingue
-    pas deux dossiers, Windows et macOS les confondant."""
+    pas deux dossiers, Windows et macOS les confondant.
+
+    Un suffixe doit survivre à la troncature de safe_name() (_nom_suffixe) :
+    sans cela, deux noms longs qui ne diffèrent qu'au-delà de 32 octets, ou un
+    nom long sur deux réseaux, faisaient chercher un suffixe libre sans fin."""
     reseaux_par_nom = defaultdict(set)
     paires = set()
     for entry in entries.values():
@@ -819,7 +848,7 @@ def _cles_camera_par_collision(entries: dict) -> dict:
             continue
         _principal, *autres = sorted(reseaux)
         for rang, reseau in enumerate(autres, start=2):
-            cles[(camera, reseau)] = f"{camera} ({rang})"
+            cles[(camera, reseau)] = _nom_suffixe(camera, rang)
 
     def dossier(cle: str) -> str:
         return safe_name(cle).casefold()
@@ -832,11 +861,15 @@ def _cles_camera_par_collision(entries: dict) -> dict:
         if dossier(nom) not in pris:
             pris.add(dossier(nom))
             continue
+        # Chaque rang donne un dossier distinct (il finit par « _<rang> ») : la
+        # recherche s'arrête au plus tard après len(pris) + len(noms) essais.
         rang = 2
-        while dossier(f"{nom} ({rang})") in pris or f"{nom} ({rang})" in noms:
+        candidat = _nom_suffixe(nom, rang)
+        while dossier(candidat) in pris or candidat in noms:
             rang += 1
-        renommes[nom] = f"{nom} ({rang})"
-        pris.add(dossier(renommes[nom]))
+            candidat = _nom_suffixe(nom, rang)
+        renommes[nom] = candidat
+        pris.add(dossier(candidat))
     for paire, nom in cles_par_paire.items():
         if nom in renommes:
             cles[paire] = renommes[nom]
